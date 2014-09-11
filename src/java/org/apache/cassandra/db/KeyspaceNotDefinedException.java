@@ -25,4 +25,9 @@ public class KeyspaceNotDefinedException extends InvalidRequestException
     {
         super(why);
     }
+
+    public boolean sortsByHashCode()
+    {
+        return false;
+    }
 }

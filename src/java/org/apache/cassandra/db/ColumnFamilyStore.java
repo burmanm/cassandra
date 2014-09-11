@@ -173,7 +173,8 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
 
             OpenType<?>[] samplerTypes = new OpenType[] { SimpleType.LONG, COUNTER_TYPE };
             SAMPLING_RESULT = new CompositeType(SAMPLING_RESULTS_NAME, SAMPLING_RESULTS_NAME, SAMPLER_NAMES, SAMPLER_DESCS, samplerTypes);
-        } catch (OpenDataException e)
+        }
+        catch (OpenDataException e)
         {
             throw Throwables.propagate(e);
         }
