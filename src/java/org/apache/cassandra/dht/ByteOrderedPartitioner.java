@@ -120,6 +120,11 @@ public class ByteOrderedPartitioner implements IPartitioner
             return token;
         }
 
+        public long comparableHashCode()
+        {
+            throw new UnsupportedOperationException();
+        }
+
         @Override
         public double size(Token next)
         {
@@ -270,6 +275,11 @@ public class ByteOrderedPartitioner implements IPartitioner
     public boolean preservesOrder()
     {
         return true;
+    }
+
+    public boolean sortsByHashCode()
+    {
+        return false;
     }
 
     public Map<Token, Float> describeOwnership(List<Token> sortedTokens)

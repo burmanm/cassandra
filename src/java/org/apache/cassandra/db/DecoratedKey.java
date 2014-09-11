@@ -36,7 +36,7 @@ import org.apache.cassandra.utils.IFilter.FilterKey;
  * if this matters, you can subclass RP to use a stronger hash, or use a non-lossy tokenization scheme (as in the
  * OrderPreservingPartitioner classes).
  */
-public abstract class DecoratedKey implements PartitionPosition, FilterKey
+public abstract class DecoratedKey implements PartitionPosition, FilterKey, IMeasurableMemory
 {
     public static final Comparator<DecoratedKey> comparator = new Comparator<DecoratedKey>()
     {
@@ -57,7 +57,7 @@ public abstract class DecoratedKey implements PartitionPosition, FilterKey
     @Override
     public int hashCode()
     {
-        return getKey().hashCode(); // hash of key is enough
+        return token.hashCode();
     }
 
     @Override
@@ -136,5 +136,10 @@ public abstract class DecoratedKey implements PartitionPosition, FilterKey
     {
         ByteBuffer key = getKey();
         MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, dest);
+    }
+
+    public long comparableHashCode()
+    {
+        return token.comparableHashCode();
     }
 }
