@@ -19,6 +19,7 @@ package org.apache.cassandra.utils.memory;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -26,8 +27,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.github.benmanes.caffeine.base.UnsafeAccess;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import sun.misc.Contended;
 import sun.nio.ch.DirectBuffer;
 
 /**
@@ -54,7 +57,11 @@ public class SlabAllocator extends MemtableBufferAllocator
     // globally stash any Regions we allocate but are beaten to using, and use these up before allocating any more
     private static final ConcurrentLinkedQueue<Region> RACE_ALLOCATED = new ConcurrentLinkedQueue<>();
 
-    private final AtomicReference<Region> currentRegion = new AtomicReference<>();
+    // Next power of two of CPU count for the region cache
+    private static final int CACHE_SIZE = 1 << (Integer.SIZE - Integer.numberOfLeadingZeros(Runtime.getRuntime().availableProcessors() - 1));
+    private static final int INDEX_MASK = CACHE_SIZE - 1;
+    private static final long PROBE = UnsafeAccess.objectFieldOffset(Thread.class, "threadLocalRandomProbe");
+    private final AtomicReference<Region>[] currentRegions;
     private final AtomicInteger regionCount = new AtomicInteger(0);
 
     // this queue is used to keep references to off-heap allocated regions so that we can free them when we are discarded
@@ -68,6 +75,11 @@ public class SlabAllocator extends MemtableBufferAllocator
         super(onHeap, offHeap);
         this.allocateOnHeapOnly = allocateOnHeapOnly;
         this.ensureOnHeap = allocateOnHeapOnly ? new EnsureOnHeap.NoOp() : new EnsureOnHeap.CloneToHeap();
+
+        currentRegions = new AtomicReference[CACHE_SIZE];
+        for(int i = 0; i < currentRegions.length; i++) {
+            currentRegions[i] = new AtomicReference<>();
+        }
     }
 
     public EnsureOnHeap ensureOnHeap()
@@ -109,7 +121,7 @@ public class SlabAllocator extends MemtableBufferAllocator
                 return cloned;
 
             // not enough space!
-            currentRegion.compareAndSet(region, null);
+            currentRegions[itemIndex()].compareAndSet(region, null);
         }
     }
 
@@ -125,10 +137,11 @@ public class SlabAllocator extends MemtableBufferAllocator
      */
     private Region getRegion()
     {
+        int index = itemIndex();
         while (true)
         {
             // Try to get the region
-            Region region = currentRegion.get();
+            Region region = currentRegions[index].get();
             if (region != null)
                 return region;
 
@@ -137,7 +150,7 @@ public class SlabAllocator extends MemtableBufferAllocator
             region = RACE_ALLOCATED.poll();
             if (region == null)
                 region = new Region(allocateOnHeapOnly ? ByteBuffer.allocate(REGION_SIZE) : ByteBuffer.allocateDirect(REGION_SIZE));
-            if (currentRegion.compareAndSet(null, region))
+            if (currentRegions[index].compareAndSet(null, region))
             {
                 if (!allocateOnHeapOnly)
                     offHeapRegions.add(region);
@@ -165,6 +178,7 @@ public class SlabAllocator extends MemtableBufferAllocator
      *    new region in is harmless
      *  - encapsulates the allocation offset
      */
+    @Contended
     private static class Region
     {
         /**
@@ -226,5 +240,17 @@ public class SlabAllocator extends MemtableBufferAllocator
                    " allocs=" + allocCount.get() + "waste=" +
                    (data.capacity() - nextFreeOffset.get());
         }
+    }
+
+    // From Caffeine / JC-Tools / etc, calculate a good index hash by using the probe
+    static int itemIndex()
+    {
+        int probe = UnsafeAccess.UNSAFE.getInt(Thread.currentThread(), PROBE);
+        if (probe == 0)
+        {
+            ThreadLocalRandom.current(); // force initialization
+            probe = UnsafeAccess.UNSAFE.getInt(Thread.currentThread(), PROBE);
+        }
+        return (probe & INDEX_MASK);
     }
 }

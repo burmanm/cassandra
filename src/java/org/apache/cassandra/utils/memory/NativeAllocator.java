@@ -21,12 +21,21 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.*;
+import com.github.benmanes.caffeine.base.UnsafeAccess;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.NativeClustering;
+import org.apache.cassandra.db.NativeDecoratedKey;
+import org.apache.cassandra.db.rows.BTreeRow;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.NativeCell;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import sun.misc.Contended;
 
 /**
  * This NativeAllocator uses global slab allocation strategy
@@ -53,13 +62,21 @@ public class NativeAllocator extends MemtableAllocator
             RACE_ALLOCATED.put(i, new RaceAllocated());
     }
 
-    private final AtomicReference<Region> currentRegion = new AtomicReference<>();
+    // Next power of two of CPU count for the region cache
+    private static final int CACHE_SIZE = 1 << (Integer.SIZE - Integer.numberOfLeadingZeros(Runtime.getRuntime().availableProcessors() - 1));
+    private static final int INDEX_MASK = CACHE_SIZE - 1;
+    private static final long PROBE = UnsafeAccess.objectFieldOffset(Thread.class, "threadLocalRandomProbe");
+    private final AtomicReference<Region>[] currentRegions;
     private final ConcurrentLinkedQueue<Region> regions = new ConcurrentLinkedQueue<>();
     private final EnsureOnHeap.CloneToHeap cloneToHeap = new EnsureOnHeap.CloneToHeap();
 
     protected NativeAllocator(NativePool pool)
     {
         super(pool.onHeap.newAllocator(), pool.offHeap.newAllocator());
+        currentRegions = new AtomicReference[CACHE_SIZE];
+        for(int i = 0; i < currentRegions.length; i++) {
+            currentRegions[i] = new AtomicReference<>();
+        }
     }
 
     private static class CloningBTreeRowBuilder extends BTreeRow.Builder
@@ -114,16 +131,17 @@ public class NativeAllocator extends MemtableAllocator
 
         while (true)
         {
-            Region region = currentRegion.get();
+            int index = itemIndex();
+            Region region = currentRegions[index].get();
             long peer;
             if (region != null && (peer = region.allocate(size)) > 0)
                 return peer;
 
-            trySwapRegion(region, size);
+            trySwapRegion(region, index, size);
         }
     }
 
-    private void trySwapRegion(Region current, int minSize)
+    private void trySwapRegion(Region current, int regionIndex, int minSize)
     {
         // decide how big we want the new region to be:
         //  * if there is no prior region, we set it to min size
@@ -145,7 +163,7 @@ public class NativeAllocator extends MemtableAllocator
 
         // we try to swap in the region we've obtained;
         // if we fail to swap the region, we try to stash it for repurposing later; if we're out of stash room, we free it
-        if (currentRegion.compareAndSet(current, next))
+        if (currentRegions[regionIndex].compareAndSet(current, next))
             regions.add(next);
         else if (!raceAllocated.stash(next))
             MemoryUtil.free(next.peer);
@@ -202,6 +220,7 @@ public class NativeAllocator extends MemtableAllocator
      *    new region in is harmless
      *  - encapsulates the allocation offset
      */
+    @Contended
     private static class Region
     {
         /**
@@ -268,4 +287,15 @@ public class NativeAllocator extends MemtableAllocator
         }
     }
 
+    // From Caffeine / JC-Tools / etc, calculate a good index hash by using the probe
+    static int itemIndex()
+    {
+        int probe = UnsafeAccess.UNSAFE.getInt(Thread.currentThread(), PROBE);
+        if (probe == 0)
+        {
+            ThreadLocalRandom.current(); // force initialization
+            probe = UnsafeAccess.UNSAFE.getInt(Thread.currentThread(), PROBE);
+        }
+        return (probe & INDEX_MASK);
+    }
 }
