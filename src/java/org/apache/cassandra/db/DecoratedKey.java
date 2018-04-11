@@ -20,6 +20,7 @@ package org.apache.cassandra.db;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 
+import org.apache.cassandra.cache.IMeasurableMemory;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.dht.Token.KeyBound;
