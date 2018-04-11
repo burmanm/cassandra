@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.db;
 
+import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,6 +30,8 @@ import com.google.common.base.Throwables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.InsertOnlyOrderedMap;
+import org.apache.cassandra.concurrent.NonBlockingHashOrderedMap;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -50,7 +53,6 @@ import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.service.ActiveRepairService;
-import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -89,7 +91,7 @@ public class Memtable implements Comparable<Memtable>
         }
     }
 
-    private static final int ROW_OVERHEAD_HEAP_SIZE = estimateRowOverhead(Integer.parseInt(System.getProperty("cassandra.memtable_row_overhead_computation_step", "100000")));
+    private static final int CSLM_ROW_OVERHEAD_HEAP_SIZE = estimateCslmRowOverhead(Integer.parseInt(System.getProperty("cassandra.memtable_row_overhead_computation_step", "100000")));
 
     private final MemtableAllocator allocator;
     private final AtomicLong liveDataSize = new AtomicLong(0);
@@ -122,7 +124,8 @@ public class Memtable implements Comparable<Memtable>
     // We index the memtable by PartitionPosition only for the purpose of being able
     // to select key range using Token.KeyBound. However put() ensures that we
     // actually only store DecoratedKey.
-    private final ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> partitions = new ConcurrentSkipListMap<>();
+    private final InsertOnlyOrderedMap<PartitionPosition, AtomicBTreePartition> partitions;
+
     public final ColumnFamilyStore cfs;
     private final long creationNano = System.nanoTime();
 
@@ -133,6 +136,7 @@ public class Memtable implements Comparable<Memtable>
     // is only used when a user update the CF comparator, to know if the
     // memtable was created with the new or old comparator.
     public final ClusteringComparator initialComparator;
+    private final int rowOverhead;
 
     private final ColumnsCollector columnsCollector;
     private final StatsCollector statsCollector = new StatsCollector();
@@ -145,6 +149,16 @@ public class Memtable implements Comparable<Memtable>
         this.allocator = MEMORY_POOL.newAllocator();
         this.initialComparator = cfs.metadata().comparator;
         this.cfs.scheduleFlush();
+        if (!cfs.getPartitioner().sortsByHashCode())
+        {
+            partitions = new InsertOnlyOrderedMap.Adapter<>(new ConcurrentSkipListMap<PartitionPosition, AtomicBTreePartition>());
+            rowOverhead = CSLM_ROW_OVERHEAD_HEAP_SIZE;
+        }
+        else
+        {
+            partitions = new NonBlockingHashOrderedMap<>();
+            rowOverhead = NonBlockingHashOrderedMap.ITEM_HEAP_OVERHEAD;
+        }
         this.columnsCollector = new ColumnsCollector(cfs.metadata().regularAndStaticColumns());
     }
 
@@ -156,6 +170,8 @@ public class Memtable implements Comparable<Memtable>
         this.cfs = null;
         this.allocator = null;
         this.columnsCollector = new ColumnsCollector(metadata.regularAndStaticColumns());
+        partitions = new NonBlockingHashOrderedMap<>();
+        rowOverhead = NonBlockingHashOrderedMap.ITEM_HEAP_OVERHEAD;
     }
 
     public MemtableAllocator getAllocator()
@@ -234,7 +250,7 @@ public class Memtable implements Comparable<Memtable>
 
     public boolean isClean()
     {
-        return partitions.isEmpty();
+        return partitions.size() == 0;
     }
 
     public boolean mayContainDataBefore(CommitLogPosition position)
@@ -273,8 +289,8 @@ public class Memtable implements Comparable<Memtable>
                 previous = empty;
                 // allocate the row overhead after the fact; this saves over allocating and having to free after, but
                 // means we can overshoot our declared limit.
-                int overhead = (int) (cloneKey.getToken().getHeapSize() + ROW_OVERHEAD_HEAP_SIZE);
-                allocator.onHeap().allocate(overhead, opGroup);
+                int overhead = (int) (cloneKey.getToken().getHeapSize() + rowOverhead);
+                allocator.onHeap().allocate(overhead + cloneKey.unsharedHeapSize(), opGroup);
                 initialSize = 8;
             }
         }
@@ -349,21 +365,22 @@ public class Memtable implements Comparable<Memtable>
         boolean isBound = keyRange instanceof Bounds;
         boolean includeStart = isBound || keyRange instanceof IncludingExcludingBounds;
         boolean includeStop = isBound || keyRange instanceof Range;
-        Map<PartitionPosition, AtomicBTreePartition> subMap;
+
+        Iterable<Map.Entry<PartitionPosition, AtomicBTreePartition>> range;
+
         if (startIsMin)
-            subMap = stopIsMin ? partitions : partitions.headMap(keyRange.right, includeStop);
+            range = stopIsMin ? partitions.range(null, null) : partitions.range(null, true, keyRange.right, includeStop);
         else
-            subMap = stopIsMin
-                   ? partitions.tailMap(keyRange.left, includeStart)
-                   : partitions.subMap(keyRange.left, includeStart, keyRange.right, includeStop);
+            range = stopIsMin ? partitions.range(keyRange.left, includeStart, null, true)
+                             : partitions.range(keyRange.left, includeStart, keyRange.right, includeStop);
 
         int minLocalDeletionTime = Integer.MAX_VALUE;
 
         // avoid iterating over the memtable if we purge all tombstones
         if (cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones())
-            minLocalDeletionTime = findMinLocalDeletionTime(subMap.entrySet().iterator());
+            minLocalDeletionTime = findMinLocalDeletionTime(range.iterator());
 
-        final Iterator<Map.Entry<PartitionPosition, AtomicBTreePartition>> iter = subMap.entrySet().iterator();
+        final Iterator<Map.Entry<PartitionPosition, AtomicBTreePartition>> iter = range.iterator();
 
         return new MemtableUnfilteredPartitionIterator(cfs, iter, minLocalDeletionTime, columnFilter, dataRange);
     }
@@ -401,7 +418,8 @@ public class Memtable implements Comparable<Memtable>
     class FlushRunnable implements Callable<SSTableMultiWriter>
     {
         private final long estimatedSize;
-        private final ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> toFlush;
+        private final Iterable<Map.Entry<PartitionPosition, AtomicBTreePartition>> toFlush;
+        private int flushSize = 0;
 
         private final boolean isBatchLogTable;
         private final SSTableMultiWriter writer;
@@ -412,25 +430,28 @@ public class Memtable implements Comparable<Memtable>
 
         FlushRunnable(PartitionPosition from, PartitionPosition to, Directories.DataDirectory flushLocation, LifecycleTransaction txn)
         {
-            this(partitions.subMap(from, to), flushLocation, from, to, txn);
+            this(partitions.range(from, to), flushLocation, from, to, txn);
         }
 
         FlushRunnable(LifecycleTransaction txn)
         {
-            this(partitions, null, null, null, txn);
+            this(partitions.range(null, null), null, null, null, txn);
         }
 
-        FlushRunnable(ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> toFlush, Directories.DataDirectory flushLocation, PartitionPosition from, PartitionPosition to, LifecycleTransaction txn)
+        FlushRunnable(Iterable<Map.Entry<PartitionPosition, AtomicBTreePartition>> toFlush, Directories.DataDirectory flushLocation, PartitionPosition from, PartitionPosition to, LifecycleTransaction txn)
         {
             this.toFlush = toFlush;
             this.from = from;
             this.to = to;
             long keySize = 0;
-            for (PartitionPosition key : toFlush.keySet())
+            for (Map.Entry<PartitionPosition, AtomicBTreePartition> entry : toFlush)
             {
+                PartitionPosition key = entry.getKey();
                 //  make sure we don't write non-sensical keys
                 assert key instanceof DecoratedKey;
                 keySize += ((DecoratedKey) key).getKey().remaining();
+                flushSize++;
+
             }
             estimatedSize = (long) ((keySize // index entries
                                     + keySize // keys in data file
@@ -459,8 +480,9 @@ public class Memtable implements Comparable<Memtable>
             int heavilyContendedRowCount = 0;
             // (we can't clear out the map as-we-go to free up memory,
             //  since the memtable is being used for queries in the "pending flush" category)
-            for (AtomicBTreePartition partition : toFlush.values())
+            for (Map.Entry<PartitionPosition, AtomicBTreePartition> entry : toFlush)
             {
+                AtomicBTreePartition partition = entry.getValue();
                 // Each batchlog partition is a separate entry in the log. And for an entry, we only do 2
                 // operations: 1) we insert the entry and 2) we delete it. Further, BL data is strictly local,
                 // we don't need to preserve tombstones for repair. So if both operation are in this
@@ -482,15 +504,17 @@ public class Memtable implements Comparable<Memtable>
             }
 
             long bytesFlushed = writer.getFilePointer();
-            logger.debug("Completed flushing {} ({}) for commitlog position {}",
-                                                                              writer.getFilename(),
-                                                                              FBUtilities.prettyPrintMemory(bytesFlushed),
-                                                                              commitLogUpperBound);
+            if (logger.isDebugEnabled())
+                logger.debug("Completed flushing {} ({}) for commitlog position {}",
+                             writer.getFilename(),
+                             FBUtilities.prettyPrintMemory(bytesFlushed),
+                             commitLogUpperBound);
+
             // Update the metrics
             cfs.metric.bytesFlushed.inc(bytesFlushed);
 
-            if (heavilyContendedRowCount > 0)
-                logger.trace("High update contention in {}/{} partitions of {} ", heavilyContendedRowCount, toFlush.size(), Memtable.this);
+            if (heavilyContendedRowCount > 0 && logger.isTraceEnabled())
+                logger.trace("High update contention in {}/{} partitions of {} ", heavilyContendedRowCount, flushSize, Memtable.this);
         }
 
         public SSTableMultiWriter createFlushWriter(LifecycleTransaction txn,
@@ -502,7 +526,7 @@ public class Memtable implements Comparable<Memtable>
                     .commitLogIntervals(new IntervalSet<>(commitLogLowerBound.get(), commitLogUpperBound.get()));
 
             return cfs.createSSTableMultiWriter(descriptor,
-                                                toFlush.size(),
+                                                flushSize,
                                                 ActiveRepairService.UNREPAIRED_SSTABLE,
                                                 ActiveRepairService.NO_PENDING_REPAIR,
                                                 sstableMetadataCollector,
@@ -517,25 +541,20 @@ public class Memtable implements Comparable<Memtable>
         }
     }
 
-    private static int estimateRowOverhead(final int count)
+    private static int estimateCslmRowOverhead(final int count)
     {
-        // calculate row overhead
-        try (final OpOrder.Group group = new OpOrder().start())
-        {
-            int rowOverhead;
-            MemtableAllocator allocator = MEMORY_POOL.newAllocator();
-            ConcurrentNavigableMap<PartitionPosition, Object> partitions = new ConcurrentSkipListMap<>();
-            final Object val = new Object();
-            for (int i = 0 ; i < count ; i++)
-                partitions.put(allocator.clone(new BufferDecoratedKey(new LongToken(i), ByteBufferUtil.EMPTY_BYTE_BUFFER), group), val);
-            double avgSize = ObjectSizes.measureDeep(partitions) / (double) count;
-            rowOverhead = (int) ((avgSize - Math.floor(avgSize)) < 0.05 ? Math.floor(avgSize) : Math.ceil(avgSize));
-            rowOverhead -= ObjectSizes.measureDeep(new LongToken(0));
-            rowOverhead += AtomicBTreePartition.EMPTY_SIZE;
-            allocator.setDiscarding();
-            allocator.setDiscarded();
-            return rowOverhead;
-        }
+        int rowOverhead;
+        ConcurrentNavigableMap<PartitionPosition, Object> partitions = new ConcurrentSkipListMap<>();
+        final Murmur3Partitioner partitioner = new Murmur3Partitioner();
+
+        final Object val = new Object();
+        for (int i = 0; i < count; i++)
+            partitions.putIfAbsent(new BufferDecoratedKey(partitioner.getRandomToken(), ByteBuffer.allocate(0)), val);
+        double avgSize = ObjectSizes.measureDeep(partitions) / (double) count;
+        rowOverhead = (int) ((avgSize - Math.floor(avgSize)) < 0.05 ? Math.floor(avgSize) : Math.ceil(avgSize));
+        rowOverhead -= ObjectSizes.measureDeep(new BufferDecoratedKey(new LongToken((long) 0), ByteBuffer.allocate(0)));
+        rowOverhead += AtomicBTreePartition.EMPTY_SIZE;
+        return rowOverhead;
     }
 
     public static class MemtableUnfilteredPartitionIterator extends AbstractUnfilteredPartitionIterator

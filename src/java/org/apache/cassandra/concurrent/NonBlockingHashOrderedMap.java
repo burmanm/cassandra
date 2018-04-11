@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -385,12 +386,17 @@ public class NonBlockingHashOrderedMap<K extends HashComparable<? super K>, V> i
     }
 
     // find the first node that is equal to or greater than key
-    private Node<K, V> onOrAfter(K key)
+    private Node<K, V> onOrAfter(K key, boolean inclusive)
     {
         long hash = key.comparableHashCode();
         Node<K, V> node = predecessor(hash);
         while (node != null && node.compareTo(hash, key) < 0)
             node = node.next;
+        if (!inclusive)
+        {
+            if (node != null && node.compareTo(hash, key) == 0)
+                node = node.next;
+        }
         return node;
     }
 
@@ -413,65 +419,59 @@ public class NonBlockingHashOrderedMap<K extends HashComparable<? super K>, V> i
     // this would not provide even distribution of the extra indexing capacity, but would spread the cost of filling in
     private void resize(final int targetSize)
     {
-        resizer.execute(new Runnable()
-        {
-            public void run()
+        resizer.execute(() -> {
+            Node<K, V>[][] resized = index;
+
+            int curLength = indexLength(resized);
+            int newLength = 1 << (32 - Integer.numberOfLeadingZeros(targetSize - 1));
+            if (newLength <= curLength)
+                return;
+
+            if (curLength <= INDEX_PAGE_SIZE)
             {
-                Node<K, V>[][] resized = index;
-
-                int curLength = indexLength(resized);
-                int newLength = 1 << (32 - Integer.numberOfLeadingZeros(targetSize - 1));
-                if (newLength <= curLength)
+                resized[0] = Arrays.copyOf(resized[0], Math.min(newLength, INDEX_PAGE_SIZE));
+                if (newLength <= INDEX_PAGE_SIZE)
                     return;
+            }
 
-                if (curLength <= INDEX_PAGE_SIZE)
-                {
-                    resized[0] = Arrays.copyOf(resized[0], Math.min(newLength, INDEX_PAGE_SIZE));
-                    if (newLength <= INDEX_PAGE_SIZE)
-                        return;
-                }
-
-                resized = Arrays.copyOf(resized, indexPage(newLength));
-                for (int i = Math.max(1, indexPage(curLength)) ; i < resized.length ; i++)
-                {
-                    resized[i] = new Node[INDEX_PAGE_SIZE];
-                    // we write to index after every update of its internal array to ensure visibility ASAP
-                    index = resized;
-                }
+            resized = Arrays.copyOf(resized, indexPage(newLength));
+            for (int i = Math.max(1, indexPage(curLength)) ; i < resized.length ; i++)
+            {
+                resized[i] = new Node[INDEX_PAGE_SIZE];
+                // we write to index after every update of its internal array to ensure visibility ASAP
+                index = resized;
             }
         });
+    }
+
+    public Iterable<Map.Entry<K, V>> range(final K lb, boolean lbInclusive, final K ub, boolean ubInclusive) {
+        final long ubHash = ub == null ? Long.MAX_VALUE : ub.comparableHashCode();
+        return () -> new Iterator<Map.Entry<K, V>>()
+        {
+            Node<K, V> node = lb == null ? head.next : onOrAfter(lb, lbInclusive);
+            public boolean hasNext()
+            {
+                return node != null && (ub == null || ubInclusive ? node.compareTo(ubHash, ub) <= 0 : node.compareTo(ubHash, ub) < 0);
+            }
+
+            public Map.Entry<K, V> next()
+            {
+                Node<K, V> r = node;
+                node = node.next;
+                return r;
+            }
+
+            public void remove()
+            {
+                throw new UnsupportedOperationException();
+            }
+        };
     }
 
     // bounds are always inclusive
     public Iterable<Map.Entry<K, V>> range(final K lb, final K ub)
     {
-        final long ubHash = ub == null ? Long.MAX_VALUE : ub.comparableHashCode();
-        return new Iterable<Map.Entry<K, V>>()
-        {
-            public Iterator<Map.Entry<K, V>> iterator()
-            {
-                return new Iterator<Map.Entry<K, V>>()
-                {
-                    Node<K, V> node = lb == null ? head.next : onOrAfter(lb);
-                    public boolean hasNext()
-                    {
-                        return node != null && (ub == null || node.compareTo(ubHash, ub) <= 0);
-                    }
-
-                    public Map.Entry<K, V> next()
-                    {
-                        Node<K, V> r = node;
-                        node = node.next;
-                        return r;
-                    }
-
-                    public void remove()
-                    {
-                        throw new UnsupportedOperationException();
-                    }
-                };
-            }
-        };
+        return range(lb, true, ub, true);
     }
 
     @VisibleForTesting
@@ -488,6 +488,7 @@ public class NonBlockingHashOrderedMap<K extends HashComparable<? super K>, V> i
     {
         long[] counts = new long[128];
         updateDistributionCounts(counts, ranges);
+        return true; // TODO Implement these..
     }
 
     private static void updateDistributionCounts(long[] counts, Collection<Range<Token>> ranges)

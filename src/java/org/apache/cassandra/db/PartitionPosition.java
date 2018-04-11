@@ -24,8 +24,9 @@ import java.nio.ByteBuffer;
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.HashComparable;
 
-public interface PartitionPosition extends RingPosition<PartitionPosition>
+public interface PartitionPosition extends RingPosition<PartitionPosition>, HashComparable<PartitionPosition>
 {
     public static enum Kind
     {

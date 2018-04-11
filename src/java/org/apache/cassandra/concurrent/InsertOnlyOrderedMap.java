@@ -27,6 +27,7 @@ public interface InsertOnlyOrderedMap<K extends Comparable<? super K>, V>
     public V putIfAbsent(K key, V value);
     public int size();
     public Iterable<Map.Entry<K, V>> range(K lb, K ub);
+    public Iterable<Map.Entry<K, V>> range(K lb, boolean lbInclusive, K ub, boolean ubInclusive);
 
     public static final class Adapter<K extends Comparable<? super K>, V> implements InsertOnlyOrderedMap<K, V>
     {
@@ -36,18 +37,22 @@ public interface InsertOnlyOrderedMap<K extends Comparable<? super K>, V>
             this.wrapped = wrapped;
         }
 
-        public Iterable<Map.Entry<K, V>> range(K lb, K ub)
+        public Iterable<Map.Entry<K, V>> range(K lb, K ub) {
+            return range(lb, true, ub, true);
+        }
+
+        public Iterable<Map.Entry<K, V>> range(K lb, boolean lbInclusive, K ub, boolean ubInclusive)
         {
             if (lb == null || ub == null)
             {
                 if (lb == null && ub == null)
                     return wrapped.entrySet();
                 else if (lb == null)
-                    return wrapped.headMap(ub, true).entrySet();
+                    return wrapped.headMap(ub, ubInclusive).entrySet();
                 else
-                    return wrapped.tailMap(lb, true).entrySet();
+                    return wrapped.tailMap(lb, lbInclusive).entrySet();
             }
-            return wrapped.subMap(lb, true, ub, true).entrySet();
+            return wrapped.subMap(lb, lbInclusive, ub, ubInclusive).entrySet();
         }
 
         public int size()
