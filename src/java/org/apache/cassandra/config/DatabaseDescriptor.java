@@ -2644,4 +2644,9 @@ public class DatabaseDescriptor
     {
         conf.corrupted_tombstone_strategy = strategy;
     }
+
+    public static boolean useLegacyFlusher()
+    {
+        return conf.native_transport_flush_in_batches_legacy;
+    }
 }
