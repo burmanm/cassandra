@@ -20,6 +20,7 @@ package org.apache.cassandra.concurrent;
 
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -90,7 +91,7 @@ public class LongNonBlockingHashOrderedMapTest
         {
             final AtomicBoolean failure = new AtomicBoolean();
             final List<WriterKeyset> results = new ArrayList<>();
-            final NonBlockingHashOrderedMap<Key, Integer> map = new NonBlockingHashOrderedMap<>();
+            final NonBlockingHashOrderedMap<Key, Integer> map = new NonBlockingHashOrderedMap<>(Collections.emptyList());
             final Keys keys = new Keys(overlap, writers, collisions, batches);
             final ReadySync sync = new ReadySync(threads);
             System.out.printf("Running (hashes=%d,overlap=%.2f,collisions=%d,threads=%d,slices=%d); %d of %d\n",
